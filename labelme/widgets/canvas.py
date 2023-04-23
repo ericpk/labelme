@@ -6,6 +6,11 @@ from labelme import QT5
 from labelme.shape import Shape
 import labelme.utils
 
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import cv2
+
 
 # TODO(unknown):
 # - [maybe] Find optimal epsilon value.
@@ -98,6 +103,9 @@ class Canvas(QtWidgets.QWidget):
         # Set widget options.
         self.setMouseTracking(True)
         self.setFocusPolicy(QtCore.Qt.WheelFocus)
+
+        self.predictor = None
+        self.refineSelection = False
 
     def fillDrawing(self):
         return self._fill_drawing
@@ -374,21 +382,25 @@ class Canvas(QtWidgets.QWidget):
                         self.line[0] = self.current[-1]
                         if self.current.isClosed():
                             self.finalise()
-                    elif self.createMode in ["rectangle", "circle", "line"]:
+                    elif self.createMode in ["circle", "line"]:
                         assert len(self.current.points) == 1
                         self.current.points = self.line.points
                         self.finalise()
+                    elif self.createMode == "rectangle":
+                        assert len(self.current.points) == 1
+                        self.current.points = self.line.points
+                        self.segment()
                     elif self.createMode == "linestrip":
                         self.current.addPoint(self.line[1])
                         self.line[0] = self.current[-1]
                         if int(ev.modifiers()) == QtCore.Qt.ControlModifier:
-                            self.finalise()
+                            self.segment()
                 elif not self.outOfPixmap(pos):
                     # Create new shape.
                     self.current = Shape(shape_type=self.createMode)
                     self.current.addPoint(pos)
                     if self.createMode == "point":
-                        self.finalise()
+                        self.segment()
                     else:
                         if self.createMode == "circle":
                             self.current.shape_type = "circle"
@@ -432,6 +444,9 @@ class Canvas(QtWidgets.QWidget):
                 self.selectedShapesCopy = []
                 self.repaint()
         elif ev.button() == QtCore.Qt.LeftButton:
+            if self.refineSelection == True:
+                self.refineSelection = False
+                self.refineSegment()
             if self.editing():
                 if (
                     self.hShape is not None
@@ -556,10 +571,10 @@ class Canvas(QtWidgets.QWidget):
             return False  # No need to move
         o1 = pos + self.offsets[0]
         if self.outOfPixmap(o1):
-            pos -= QtCore.QPointF(min(0, o1.x()), min(0, o1.y()))
+            pos -= QtCore.QPoint(min(0, o1.x()), min(0, o1.y()))
         o2 = pos + self.offsets[1]
         if self.outOfPixmap(o2):
-            pos += QtCore.QPointF(
+            pos += QtCore.QPoint(
                 min(0, self.pixmap.width() - o2.x()),
                 min(0, self.pixmap.height() - o2.y()),
             )
@@ -709,6 +724,125 @@ class Canvas(QtWidgets.QWidget):
         self.newShape.emit()
         self.update()
 
+    def refineSegment(self):
+        self.current = None
+        if self.selectedShapes:
+            self.current = self.selectedShapes[-1]
+        else:
+            self.current = self.shapes[-1]
+
+        xx = []
+        yy = []
+
+        for pt in self.current.points:
+            x = float(pt.x())
+            y = float(pt.y())
+
+            xx.append(x)
+            yy.append(y)
+
+        boxbox = np.array([np.min(xx), np.min(yy), np.max(xx), np.max(yy)])
+        pt_avg = np.array([[np.mean(xx), np.mean(yy)]])
+        label = np.array([1])
+
+        masks, scores, logits = self.predictor.predict(
+            point_coords=pt_avg,
+            point_labels=label,
+            box = boxbox[None, :],
+            multimask_output=False,
+        )
+
+        mask = masks[np.argmax(scores)].astype(np.uint8)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) != 0:
+            cont = max(contours, key=len)
+            epsilon = 4#*cv2.arcLength(contours[0],True)
+
+            approx = cv2.approxPolyDP(cont,epsilon,True)
+
+            self.current.points = []
+
+            for ap in approx:
+                xy = np.squeeze(ap)
+                self.current.addPoint(QtCore.QPointF(xy[0], xy[1]))
+
+            self.current.close()
+            self.current = None
+            self.update()
+
+
+
+    def segment(self):
+        assert self.current
+        self.current.close()
+
+        if self.current.shape_type == "point":
+            x = self.current.points[0].x()
+            y = self.current.points[0].y()
+
+            pts = np.array([[float(x), float(y)]])
+            label = np.array([1])
+            self.current = None
+
+            masks, scores, logits = self.predictor.predict(
+                point_coords=pts,
+                point_labels=label,
+                multimask_output=False,
+            )
+        elif self.current.shape_type == "rectangle":
+            x0 = self.current.points[0].x()
+            y0 = self.current.points[0].y()
+            x1 = self.current.points[1].x()
+            y1 = self.current.points[1].y()
+
+            pts = np.array([float(x0), float(y0), float(x1), float(y1)])
+            self.current = None
+
+            masks, scores, logits = self.predictor.predict(
+                point_coords=None,
+                point_labels=None,
+                box = pts[None, :],
+                multimask_output=False,
+            )
+        elif self.current.shape_type == "linestrip":
+            pts = np.empty(shape=[0,2])
+            label = []
+
+            for pt in self.current.points:
+                x = float(pt.x())
+                y = float(pt.y())
+
+                pts = np.append(pts, [[x, y]], axis=0)
+                label.append(1)
+            label = np.array(label)
+            self.current = None
+                
+            masks, scores, logits = self.predictor.predict(
+                point_coords=pts,
+                point_labels=label,
+                multimask_output=False,
+            )
+
+        mask = masks[np.argmax(scores)].astype(np.uint8)
+
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if len(contours) != 0:
+            cont = max(contours, key=len)
+            epsilon = 4#*cv2.arcLength(contours[0],True)
+
+            approx = cv2.approxPolyDP(cont,epsilon,True)
+
+            self.current = Shape(shape_type="polygon")
+
+            for ap in approx:
+                xy = np.squeeze(ap)
+                self.current.addPoint(QtCore.QPointF(xy[0], xy[1]))
+        
+            self.finalise()
+        
+
+
     def closeEnough(self, p1, p2):
         # d = distance(p1 - p2)
         # m = (p1-p2).manhattanLength()
@@ -827,7 +961,10 @@ class Canvas(QtWidgets.QWidget):
                 self.drawingPolygon.emit(False)
                 self.update()
             elif key == QtCore.Qt.Key_Return and self.canCloseShape():
-                self.finalise()
+                if self.current.shape_type == "linestrip":
+                    self.segment()
+                else:
+                    self.finalise()
             elif modifiers == QtCore.Qt.AltModifier:
                 self.snapping = False
         elif self.editing():

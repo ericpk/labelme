@@ -93,7 +93,6 @@ class LabelDialog(QtWidgets.QDialog):
             )
         self.labelList.currentItemChanged.connect(self.labelSelected)
         self.labelList.itemDoubleClicked.connect(self.labelDoubleClicked)
-        self.labelList.setFixedHeight(150)
         self.edit.setListWidget(self.labelList)
         layout.addWidget(self.labelList)
         # label_flags
@@ -104,11 +103,6 @@ class LabelDialog(QtWidgets.QDialog):
         self.resetFlags()
         layout.addItem(self.flagsLayout)
         self.edit.textChanged.connect(self.updateFlags)
-        # text edit
-        self.editDescription = QtWidgets.QTextEdit()
-        self.editDescription.setPlaceholderText("Label description")
-        self.editDescription.setFixedHeight(50)
-        layout.addWidget(self.editDescription)
         self.setLayout(layout)
         # completion
         completer = QtWidgets.QCompleter()
@@ -206,9 +200,7 @@ class LabelDialog(QtWidgets.QDialog):
             return int(group_id)
         return None
 
-    def popUp(
-        self, text=None, move=True, flags=None, group_id=None, description=None
-    ):
+    def popUp(self, text=None, move=True, flags=None, group_id=None):
         if self._fit_to_content["row"]:
             self.labelList.setMinimumHeight(
                 self.labelList.sizeHintForRow(0) * self.labelList.count() + 2
@@ -220,10 +212,6 @@ class LabelDialog(QtWidgets.QDialog):
         # if text is None, the previous label in self.edit is kept
         if text is None:
             text = self.edit.text()
-        # description is always initialized by empty text c.f., self.edit.text
-        if description is None:
-            description = ""
-        self.editDescription.setPlainText(description)
         if flags:
             self.setFlags(flags)
         else:
@@ -245,11 +233,6 @@ class LabelDialog(QtWidgets.QDialog):
         if move:
             self.move(QtGui.QCursor.pos())
         if self.exec_():
-            return (
-                self.edit.text(),
-                self.getFlags(),
-                self.getGroupId(),
-                self.editDescription.toPlainText(),
-            )
+            return self.edit.text(), self.getFlags(), self.getGroupId()
         else:
-            return None, None, None, None
+            return None, None, None

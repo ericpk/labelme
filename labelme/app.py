@@ -34,6 +34,19 @@ from labelme.widgets import ToolBar
 from labelme.widgets import UniqueLabelQListWidget
 from labelme.widgets import ZoomWidget
 
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+import cv2
+
+# Segment anything mask generation
+from segment_anything import sam_model_registry, SamPredictor
+
+sam_checkpoint = "D:\FinalProject\sam_vit_h_4b8939.pth"
+model_type = "vit_h"
+device = "cuda"
+#device = "cpu"
+
 # FIXME
 # - [medium] Set max zoom value to something big enough for FitWidth/Window
 
@@ -375,7 +388,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self.tr("Move and edit the selected polygons"),
             enabled=False,
         )
-
+        refine = action(
+            self.tr("Refine Selection"),
+            self.refineSelectionMode,
+            shortcuts["refine_polygon"],
+            "edit",
+            self.tr("Refine polygon selection"),
+            enabled=False,
+        )
         delete = action(
             self.tr("Delete Polygons"),
             self.deleteSelectedShape,
@@ -598,6 +618,7 @@ class MainWindow(QtWidgets.QMainWindow):
             removePoint=removePoint,
             createMode=createMode,
             editMode=editMode,
+            refineSelection=refine,
             createRectangleMode=createRectangleMode,
             createCircleMode=createCircleMode,
             createLineMode=createLineMode,
@@ -638,6 +659,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 createPointMode,
                 createLineStripMode,
                 editMode,
+                refine,
                 edit,
                 duplicate,
                 copy,
@@ -764,8 +786,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.output_file = output_file
         self.output_dir = output_dir
 
+        # Set segmenter
+        sam = sam_model_registry[model_type](checkpoint=sam_checkpoint)
+        sam.to(device=device)
+
+        self.predictor = SamPredictor(sam)
+
         # Application state.
         self.image = QtGui.QImage()
+        self.cv2image = None
         self.imagePath = None
         self.recentFiles = []
         self.maxRecent = 7
@@ -883,6 +912,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.actions.createLineMode.setEnabled(True)
         self.actions.createPointMode.setEnabled(True)
         self.actions.createLineStripMode.setEnabled(True)
+        self.actions.refineSelection.setEnabled(True)
         title = __appname__
         if self.filename is not None:
             title = "{} - {}".format(title, self.filename)
@@ -946,6 +976,7 @@ class MainWindow(QtWidgets.QMainWindow):
         In the middle of drawing, toggling between modes should be disabled.
         """
         self.actions.editMode.setEnabled(not drawing)
+        self.actions.refineSelection.setEnabled(not drawing)
         self.actions.undoLastPoint.setEnabled(drawing)
         self.actions.undo.setEnabled(not drawing)
         self.actions.delete.setEnabled(not drawing)
@@ -1010,6 +1041,9 @@ class MainWindow(QtWidgets.QMainWindow):
     def setEditMode(self):
         self.toggleDrawMode(True)
 
+    def refineSelectionMode(self):
+        self.canvas.refineSelection = True
+
     def updateFileMenu(self):
         current = self.filename
 
@@ -1055,11 +1089,10 @@ class MainWindow(QtWidgets.QMainWindow):
         shape = item.shape()
         if shape is None:
             return
-        text, flags, group_id, description = self.labelDialog.popUp(
+        text, flags, group_id = self.labelDialog.popUp(
             text=shape.label,
             flags=shape.flags,
             group_id=shape.group_id,
-            description=shape.description,
         )
         if text is None:
             return
@@ -1074,7 +1107,6 @@ class MainWindow(QtWidgets.QMainWindow):
         shape.label = text
         shape.flags = flags
         shape.group_id = group_id
-        shape.description = description
 
         self._update_shape_color(shape)
         if shape.group_id is None:
@@ -1206,7 +1238,6 @@ class MainWindow(QtWidgets.QMainWindow):
             points = shape["points"]
             shape_type = shape["shape_type"]
             flags = shape["flags"]
-            description = shape["description"]
             group_id = shape["group_id"]
             other_data = shape["other_data"]
 
@@ -1218,7 +1249,6 @@ class MainWindow(QtWidgets.QMainWindow):
                 label=label,
                 shape_type=shape_type,
                 group_id=group_id,
-                description=description,
             )
             for x, y in points:
                 shape.addPoint(QtCore.QPointF(x, y))
@@ -1255,7 +1285,6 @@ class MainWindow(QtWidgets.QMainWindow):
                     label=s.label.encode("utf-8") if PY2 else s.label,
                     points=[(p.x(), p.y()) for p in s.points],
                     group_id=s.group_id,
-                    description=s.description,
                     shape_type=s.shape_type,
                     flags=s.flags,
                 )
@@ -1351,7 +1380,7 @@ class MainWindow(QtWidgets.QMainWindow):
         group_id = None
         if self._config["display_label_popup"] or not text:
             previous_text = self.labelDialog.edit.text()
-            text, flags, group_id, description = self.labelDialog.popUp(text)
+            text, flags, group_id = self.labelDialog.popUp(text)
             if not text:
                 self.labelDialog.edit.setText(previous_text)
 
@@ -1367,7 +1396,6 @@ class MainWindow(QtWidgets.QMainWindow):
             self.labelList.clearSelection()
             shape = self.canvas.setLastLabel(text, flags)
             shape.group_id = group_id
-            shape.description = description
             self.addLabel(shape)
             self.actions.editMode.setEnabled(True)
             self.actions.undoLastPoint.setEnabled(False)
@@ -1542,6 +1570,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self.status(self.tr("Error reading %s") % filename)
             return False
         self.image = image
+
+        # segmentation 
+        cv2image = cv2.imread(filename)
+        self.predictor.set_image(cv2image)
+        self.canvas.predictor = self.predictor
+
         self.filename = filename
         if self._config["keep_prev"]:
             prev_shapes = self.canvas.shapes
